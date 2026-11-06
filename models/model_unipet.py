@@ -1,307 +1,159 @@
+"""ARI-PET training wrapper. Compatibility class name: UniPETModel."""
 from collections import OrderedDict
-import torch.nn.functional as F
-from torch.optim import lr_scheduler
-from torch.optim import Adam, AdamW
+from copy import deepcopy
+from pathlib import Path
+import torch
 from models.select_network import define_G
-from models.model_base import ModelBase
-from models.loss import CharbonnierLoss
-from utils.utils_regularizers import regularizer_orth, regularizer_clip
-from utils.utils_unipet import *
-from math import ceil
+from models.pet_objective import compute_total_loss, compute_orth_loss
+from utils.pet_scaling import NORMALIZATION
 
 
-def compute_orth_loss(z_sh, z_sp):
-    """计算共享特征与特定特征的正交约束loss"""
-    zsh_vec = F.normalize(z_sh.flatten(1), dim=1)
-    zsp_vec = F.normalize(z_sp.flatten(1), dim=1)
-    return ((zsh_vec * zsp_vec).sum(dim=1) ** 2).mean()
-
-
-class UniPETModel(ModelBase):
-
+class UniPETModel:
     def __init__(self, opt):
-        super(UniPETModel, self).__init__(opt)
-
-        self.opt_train = self.opt['train']    # training option
-        self.opt_dataset = self.opt['datasets']
-
-        # 读取显像剂数量（由 main_train.py 注入到 opt['netG']）
-        num_tracers = self.opt['netG'].get('num_tracers', 4)
-
-        self.netG = define_G(opt, num_tracers=num_tracers)
-        self.netG = self.model_to_device(self.netG)
-        if self.opt_train['freeze_patch_embedding']:
-            for para in self.netG.module.patch_embed.parameters():
-                para.requires_grad = False
-            print("Patch Embedding Frozen (Requires Grad)!")
-        if self.opt_train['E_decay'] > 0:
-            self.netE = define_G(opt, num_tracers=num_tracers).to(self.device).eval()
-
-        # 初始化 tracer_label（避免 feed_data 前被引用）
-        self.tracer_label = None
-        self.tracer_logits = None
-        self.z_sh = None
-        self.z_sp = None
-
-
+        self.opt = opt
+        self.opt_train = opt["train"]
+        self.device = torch.device(opt.get("device", "cuda" if opt.get("gpu_ids") else "cpu"))
+        self.netG = define_G(opt).to(self.device)
+        if self.opt_train.get("freeze_patch_embedding", False):
+            self.netG.patch_embed.requires_grad_(False)
+        self.decay = float(self.opt_train.get("E_decay", 0.999))
+        self.netE = deepcopy(self.netG).eval().requires_grad_(False) if self.decay > 0 else None
+        self.domain_label = None
+        self.H = None
+        self.log_dict = OrderedDict()
+        self.schedulers = []
 
     def init_train(self):
-        self.load()                           # load model
-        self.netG.train()                     # set training mode,for BN
-        self.define_loss()                    # define loss
-        self.define_optimizer()               # define optimizer
-        self.load_optimizers()                # load optimizer
-        self.define_scheduler()               # define scheduler
-        self.log_dict = OrderedDict()         # log
-
-
+        self.load()
+        self.netG.train()
+        self.define_optimizer()
+        self.define_scheduler()
 
     def load(self):
-        load_path_G = self.opt['path']['pretrained_netG']
-        if load_path_G is not None:
-            print('Loading model for G [{:s}] ...'.format(load_path_G))
-            self.load_network(load_path_G, self.netG, strict=self.opt_train['G_param_strict'], param_key='params')
-        load_path_E = self.opt['path']['pretrained_netE']
-        if self.opt_train['E_decay'] > 0:
-            if load_path_E is not None:
-                print('Loading model for E [{:s}] ...'.format(load_path_E))
-                self.load_network(load_path_E, self.netE, strict=self.opt_train['E_param_strict'], param_key='params_ema')
-            else:
-                print('Copying model for E ...')
-                self.update_E(0)
-            self.netE.eval()
-
-
-    def load_optimizers(self):
-        load_path_optimizerG = self.opt['path']['pretrained_optimizerG']
-        if load_path_optimizerG is not None and self.opt_train['G_optimizer_reuse']:
-            print('Loading optimizerG [{:s}] ...'.format(load_path_optimizerG))
-            self.load_optimizer(load_path_optimizerG, self.G_optimizer)
-
-
-    def save(self, iter_label):
-        self.save_network(self.save_dir, self.netG, 'G', iter_label)
-        if self.opt_train['E_decay'] > 0:
-            self.save_network(self.save_dir, self.netE, 'E', iter_label)
-        if self.opt_train['G_optimizer_reuse']:
-            self.save_optimizer(self.save_dir, self.G_optimizer, 'optimizerG', iter_label)
-
-
-    def define_loss(self):
-        G_lossfn_type = self.opt_train['G_lossfn_type']
-        if G_lossfn_type == 'l1':
-            self.G_lossfn = nn.L1Loss().to(self.device)
-        elif G_lossfn_type == 'l2':
-            self.G_lossfn = nn.MSELoss().to(self.device)
-        elif G_lossfn_type == 'l2sum':
-            self.G_lossfn = nn.MSELoss(reduction='sum').to(self.device)
-        elif G_lossfn_type == 'ssim':
-            self.G_lossfn = SSIMLoss().to(self.device)
-        elif G_lossfn_type == 'charbonnier':
-            self.G_lossfn = CharbonnierLoss(self.opt_train['G_charbonnier_eps']).to(self.device)
-        else:
-            raise NotImplementedError('Loss type [{:s}] is not found.'.format(G_lossfn_type))
-        self.G_lossfn_weight = self.opt_train['G_lossfn_weight']
-
-    def Etob(self, x):
-        x = x.permute(0, 2, 3, 1).contiguous()
-        x = torch.view_as_complex(x)
-        fftx = torch.fft.fftn(torch.fft.fftshift(x, dim=(-2, -1)), dim=(-2, -1))
-        fftx = torch.view_as_real(fftx)
-        fftx = fftx.permute(0, 3, 1, 2).contiguous()
-        return fftx
-
-    def total_loss(self):
-        # --- 超参 ---
-        self.alpha = self.opt_train['alpha']
-        # lambda_cls / lambda_orth 在 JSON 里配置，没有则取默认值
-        self.lambda_cls = self.opt_train.get('lambda_cls', 0.1)
-        self.lambda_orth = self.opt_train.get('lambda_orth', 0.01)
-
-        # --- 重建 Loss（图像域 + k空间域，与原来完全一致）---
-        self.E_cat = torch.cat((self.E, torch.zeros_like(self.E)), dim=1)
-        self.Efft = self.Etob(self.E_cat)
-        self.H_cat = torch.cat((self.H, torch.zeros_like(self.H)), dim=1)
-        self.Hfft = self.Etob(self.H_cat)
-
-        self.loss_image = self.G_lossfn(self.E, self.H)
-        self.loss_kspace = self.G_lossfn(self.Efft, self.Hfft)
-        loss_rec = self.alpha * self.loss_image + 1.0 * self.loss_kspace
-
-        # --- 分类 Loss（显像剂分类交叉熵）---
-        self.loss_cls = F.cross_entropy(self.tracer_logits, self.tracer_label)
-
-        # --- 正交 Loss（共享 / 特定特征解耦）---
-        self.loss_orth = compute_orth_loss(self.z_sh, self.z_sp)
-        total = loss_rec 
-        #total = loss_rec + self.lambda_cls * self.loss_cls + self.lambda_orth * self.loss_orth
-        return total
-
+        paths = self.opt.get("path", {})
+        if paths.get("pretrained_netG"):
+            state = torch.load(paths["pretrained_netG"], map_location="cpu", weights_only=False)
+            self.netG.load_state_dict(state.get("params", state), strict=True)
+            if self.netE is not None:
+                self.netE.load_state_dict(state.get("params_ema", self.netG.state_dict()), strict=True)
+        if paths.get("pretrained_netE"):
+            if self.netE is None:
+                raise ValueError("EMA is disabled")
+            state = torch.load(paths["pretrained_netE"], map_location="cpu", weights_only=False)
+            self.netE.load_state_dict(state.get("params_ema", state), strict=True)
 
     def define_optimizer(self):
-        G_optim_params = []
-        for k, v in self.netG.named_parameters():
-            if v.requires_grad:
-                G_optim_params.append(v)
-            else:
-                print('Params [{:s}] will not optimize.'.format(k))
-
-        if self.opt_train['G_optimizer_type'] == 'adam':
-            if self.opt_train['freeze_patch_embedding']:
-                self.G_optimizer = Adam(filter(lambda p: p.requires_grad, G_optim_params), lr=self.opt_train['G_optimizer_lr'], weight_decay=self.opt_train['G_optimizer_wd'])
-                print("Patch Embedding Frozen (Optimizer)!")
-            else:
-                self.G_optimizer = Adam(G_optim_params, lr=self.opt_train['G_optimizer_lr'], weight_decay=self.opt_train['G_optimizer_wd'])
-        elif self.opt_train['G_optimizer_type'] == 'adamw':
-            if self.opt_train['freeze_patch_embedding']:
-                self.G_optimizer = AdamW(filter(lambda p: p.requires_grad, G_optim_params), lr=self.opt_train['G_optimizer_lr'],  weight_decay=self.opt_train['G_optimizer_wd'])
-                print("Patch Embedding Frozen (Optimizer)!")
-            else:
-                self.G_optimizer = AdamW(G_optim_params, lr=self.opt_train['G_optimizer_lr'], weight_decay=self.opt_train['G_optimizer_wd'])
-        else:
-            raise NotImplementedError
+        if self.opt_train.get("G_optimizer_type", "adam").lower() != "adam":
+            raise ValueError("The manuscript configuration uses Adam")
+        self.G_optimizer = torch.optim.Adam(
+            [p for p in self.netG.parameters() if p.requires_grad],
+            lr=self.opt_train.get("G_optimizer_lr", 2e-4), betas=(0.9, 0.999),
+            weight_decay=self.opt_train.get("G_optimizer_wd", 0.0))
 
     def define_scheduler(self):
-        self.schedulers.append(lr_scheduler.MultiStepLR(self.G_optimizer,
-                                                        self.opt_train['G_scheduler_milestones'],
-                                                        self.opt_train['G_scheduler_gamma']
-                                                        ))
-
+        self.schedulers = [torch.optim.lr_scheduler.MultiStepLR(
+            self.G_optimizer, self.opt_train.get("G_scheduler_milestones", [500000, 1000000]),
+            gamma=self.opt_train.get("G_scheduler_gamma", 0.5))]
 
     def feed_data(self, data, need_H=True):
-        self.H = data['H'].to(self.device)
-        self.L = data['L'].to(self.device)
-        # 接收显像剂标签（测试时 data 可能不含 tracer_label，兼容处理）
-        if 'tracer_label' in data:
-            self.tracer_label = data['tracer_label'].to(self.device)
-        else:
-            self.tracer_label = None
+        self.L = data["L"].to(self.device)
+        self.H = data["H"].to(self.device) if need_H else None
+        self.domain_label = data.get("domain_label", data.get("tracer_label"))
+        if self.domain_label is not None:
+            self.domain_label = self.domain_label.to(self.device)
+        self.scale = data.get("scale")
 
     def netG_forward(self):
-        # 新网络返回 (pred, tracer_logits, z_sh, z_sp)
         self.E, self.tracer_logits, self.z_sh, self.z_sp = self.netG(self.L)
 
+    def total_loss(self):
+        if self.H is None:
+            raise ValueError("Training requires an ASC reference")
+        total, terms = compute_total_loss(
+            self.E, self.H, self.tracer_logits, self.domain_label, self.z_sh, self.z_sp,
+            alpha=self.opt_train.get("alpha", 15.0),
+            lambda_cls=self.opt_train.get("lambda_cls", 0.1),
+            lambda_orth=self.opt_train.get("lambda_orth", 0.01),
+            eps=self.opt_train.get("G_charbonnier_eps", 1e-9))
+        self.log_dict = OrderedDict([("G_loss", total.detach().item())])
+        self.log_dict.update(("G_" + k, v.detach().item()) for k, v in terms.items())
+        return total
+
     def optimize_parameters(self, current_step):
-        self.current_step = current_step
-        self.G_optimizer.zero_grad()
-        self.netG_forward()
-
-        G_loss = self.G_lossfn_weight * self.total_loss()
-        G_loss.backward()
-
-        # ------------------------------------
-        # clip_grad
-        # ------------------------------------
-        G_optimizer_clipgrad = self.opt_train['G_optimizer_clipgrad'] if self.opt_train['G_optimizer_clipgrad'] else 0
-        if G_optimizer_clipgrad > 0:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.opt_train['G_optimizer_clipgrad'], norm_type=2)
-
-        self.G_optimizer.step()
-
-        G_regularizer_orthstep = self.opt_train['G_regularizer_orthstep'] if self.opt_train['G_regularizer_orthstep'] else 0
-        if G_regularizer_orthstep > 0 and current_step % G_regularizer_orthstep == 0 and current_step % self.opt['train']['checkpoint_save'] != 0:
-            self.netG.apply(regularizer_orth)
-        G_regularizer_clipstep = self.opt_train['G_regularizer_clipstep'] if self.opt_train['G_regularizer_clipstep'] else 0
-        if G_regularizer_clipstep > 0 and current_step % G_regularizer_clipstep == 0 and current_step % self.opt['train']['checkpoint_save'] != 0:
-            self.netG.apply(regularizer_clip)
-
-        # 记录 log
-        self.log_dict['G_loss'] = G_loss.item()
-        self.log_dict['G_loss_image'] = self.loss_image.item()
-        self.log_dict['G_loss_frequency'] = self.loss_kspace.item()
-        self.log_dict['G_loss_cls'] = self.loss_cls.item()
-        self.log_dict['G_loss_orth'] = self.loss_orth.item()
-
-        if self.opt_train['E_decay'] > 0:
-            self.update_E(self.opt_train['E_decay'])
-
-    def record_loss_for_val(self):
-        G_loss = self.G_lossfn_weight * self.total_loss()
-
-        self.log_dict['G_loss'] = G_loss.item()
-        self.log_dict['G_loss_image'] = self.loss_image.item()
-        self.log_dict['G_loss_frequency'] = self.loss_kspace.item()
-        self.log_dict['G_loss_cls'] = self.loss_cls.item()
-        self.log_dict['G_loss_orth'] = self.loss_orth.item()
-
-
-    def check_windowsize(self):
-        self.window_size = self.opt['netG']['window_size']
-        _, _, h_old, w_old = self.H.size()
-        h_pad = ceil(h_old / self.window_size) * self.window_size - h_old
-        w_pad = ceil(w_old / self.window_size) * self.window_size - w_old
-        self.h_old = h_old
-        self.w_old = w_old
-        self.H = torch.cat([self.H, torch.flip(self.H, [2])], 2)[:, :, :h_old + h_pad, :]
-        self.H = torch.cat([self.H, torch.flip(self.H, [3])], 3)[:, :, :, :w_old + w_pad]
-        self.L = torch.cat([self.L, torch.flip(self.L, [2])], 2)[:, :, :h_old + h_pad, :]
-        self.L = torch.cat([self.L, torch.flip(self.L, [3])], 3)[:, :, :, :w_old + w_pad]
-
-    def recover_windowsize(self):
-        self.L = self.L[..., :self.h_old, :self.w_old]
-        self.H = self.H[..., :self.h_old, :self.w_old]
-        self.E = self.E[..., :self.h_old, :self.w_old]
-
-
-    def test(self):
-        self.netG.eval()
-        with torch.no_grad():
-            self.netG_forward()
         self.netG.train()
+        self.G_optimizer.zero_grad(set_to_none=True)
+        self.netG_forward()
+        loss = self.total_loss()
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite training loss")
+        loss.backward()
+        clip = self.opt_train.get("G_optimizer_clipgrad")
+        if clip:
+            torch.nn.utils.clip_grad_norm_(self.netG.parameters(), clip)
+        self.G_optimizer.step()
+        self.update_E(self.decay)
 
+    @torch.no_grad()
+    def update_E(self, decay=0.999):
+        if self.netE is None:
+            return
+        for ema, current in zip(self.netE.parameters(), self.netG.parameters()):
+            ema.mul_(decay).add_(current, alpha=1 - decay)
+        for ema, current in zip(self.netE.buffers(), self.netG.buffers()):
+            ema.copy_(current)
+        self.netE.eval()
+
+    @torch.no_grad()
+    def test(self):
+        network = self.netE if self.netE is not None else self.netG
+        prior_training = network.training
+        network.eval()
+        try:
+            self.E, self.tracer_logits, self.z_sh, self.z_sp = network(self.L)
+        finally:
+            network.train(prior_training)
+
+    def update_learning_rate(self, step=None):
+        for scheduler in self.schedulers:
+            scheduler.step()
+
+    def current_learning_rate(self):
+        return self.G_optimizer.param_groups[0]["lr"]
 
     def current_log(self):
         return self.log_dict
 
+    def current_results(self, need_H=True, suv=False):
+        values = {"L": self.L, "E": self.E}
+        if need_H:
+            values["H"] = self.H
+        if suv:
+            if self.scale is None:
+                raise ValueError("NASC-derived scale is required for SUV restoration")
+            scale = torch.as_tensor(self.scale, device=self.device).reshape(-1, 1, 1, 1)
+            values = {key: value * scale for key, value in values.items()}
+        return OrderedDict((key, value.detach().float().cpu()) for key, value in values.items())
 
     def current_visuals(self, need_H=True):
-        out_dict = OrderedDict()
-        out_dict['L'] = self.L.detach()[0].float().cpu()
-        out_dict['E'] = self.E.detach()[0].float().cpu()
-        if need_H:
-            out_dict['H'] = self.H.detach()[0].float().cpu()
-        return out_dict
-
-    def current_visuals_gpu(self, need_H=True):
-        out_dict = OrderedDict()
-        out_dict['L'] = self.L.detach()[0].float()
-        out_dict['E'] = self.E.detach()[0].float()
-        if need_H:
-            out_dict['H'] = self.H.detach()[0].float()
-        return out_dict
-
-
-    def current_results(self, need_H=True):
-        out_dict = OrderedDict()
-        out_dict['L'] = self.L.detach().float().cpu()
-        out_dict['E'] = self.E.detach().float().cpu()
-        if need_H:
-            out_dict['H'] = self.H.detach().float().cpu()
-        return out_dict
-
-    def current_results_gpu(self, need_H=True):
-        out_dict = OrderedDict()
-        out_dict['L'] = self.L.detach().float()
-        out_dict['E'] = self.E.detach().float()
-        if need_H:
-            out_dict['H'] = self.H.detach().float()
-        return out_dict
-
-
-    def print_network(self):
-        msg = self.describe_network(self.netG)
-        print(msg)
-
-
-    def print_params(self):
-        msg = self.describe_params(self.netG)
-        print(msg)
+        return OrderedDict((k, v[0]) for k, v in self.current_results(need_H).items())
 
     def info_network(self):
-        msg = self.describe_network(self.netG)
-        return msg
-
+        return str(self.netG)
 
     def info_params(self):
-        msg = self.describe_params(self.netG)
-        return msg
+        return "Parameters: {:,}".format(sum(p.numel() for p in self.netG.parameters()))
+
+    def save(self, iter_label, metadata=None):
+        path = Path(self.opt["path"]["models"]) / (str(iter_label) + ".pth")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Exclusive creation keeps existing training records immutable.
+        state = {"format_version": 1, "normalization": NORMALIZATION,
+                 "frequency_grid": "unshifted_fftfreq_nyquist_v1",
+                 "params": self.netG.state_dict(),
+                 "params_ema": self.netE.state_dict() if self.netE is not None else None,
+                 "optimizer": self.G_optimizer.state_dict(),
+                 "scheduler": self.schedulers[0].state_dict(),
+                 "config": self.opt, "metadata": metadata or {}}
+        with path.open("xb") as stream:
+            torch.save(state, stream)
+        return path

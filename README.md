@@ -1,172 +1,198 @@
-# UniPET
+# ARI-PET
 
-UniPET is a PyTorch project for PET image reconstruction. The current pipeline
-learns to reconstruct high-quality PET images from low-quality or
-non-attenuation-corrected inputs. The model uses image-domain restoration,
-frequency-domain refinement, and tracer/scanner-aware feature learning.
+Acquisition- and radiotracer-informed CT-free PET attenuation and scatter
+correction. The input is SUV-valued NASC PET and the output is SUV-valued ASC PET.
+The model processes 200 x 200 axial slices and assembles complete 3D volumes.
 
-The default experiment is configured by `train_unipet_G1D30.json` and launched
-through `main_train.py`.
+## Installation
 
-## Repository
+Use Python 3.10+ and install a PyTorch build for your CPU/CUDA platform, then:
 
-```text
-UniPET/
-|-- main_train.py                 # Training entry point
-|-- train_unipet_G1D30.json       # Default configuration
-|-- data/                         # Dataset loader
-|-- models/                       # Network and training wrapper
-|-- utils/                        # Logging, metrics, and options
-|-- trainsets/                    # Training data
-`-- testset/                      # Test data
-```
+~~~bash
+pip install -r requirements.txt
+~~~
 
-## Environment
+The active implementation requires PyTorch 2.1 or later. The manuscript
+configuration uses a single NVIDIA GeForce RTX 3090 GPU and batch size 2.
+The BasicSR and general-purpose utility modules retained in this repository
+are not alternative ARI-PET training entry points.
 
-Create a Python environment and install the main dependencies:
+## Data contract
 
-```bash
-conda create -n unipet python=3.10 -y
-conda activate unipet
+Convert NASC and paired CT-based ASC images to **SUV** before using this loader.
+MAT files contain an aligned, finite array named "output", with axis order
+H x W x S. The loader does not infer SUV conversion from image intensity.
+No image augmentation is applied. All slices, including constant slices, are
+retained. Shape mismatches are rejected instead of silently trimming slices.
 
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install numpy scipy opencv-python scikit-image matplotlib einops tensorboardX lpips pytorch-fid
-pip install SimpleITK medpy PyWavelets timm
-```
+A private CSV manifest supplies:
 
-Please choose the PyTorch installation command according to your CUDA version.
+~~~text
+patient_id,study_id,scanner,radiotracer,split,nasc,asc
+~~~
 
-## Data Format
+Use de-identified identifiers. "study_id" is unique per examination and
+"patient_id" groups repeated examinations. Paths are absolute or relative to
+the manifest. The split is "train", "val", or "test". Every examination from a
+patient must use the same split. Inference only requires "nasc"; "asc" can be
+empty unless metrics are requested.
 
-The project expects paired `.mat` files:
+Scanner values are Siemens, SinoUnion, or UIH. Radiotracer values are FDG,
+DOTATATE, MFBG, FAPI, CXCR4, DOPA, or PSMA. These fields come from acquisition
+metadata. They are not inferred from target-image intensities or from arbitrary
+positions in a filename. To populate them from DICOM headers:
 
-```text
-trainsets/
-|-- AC/      # Target PET images
-`-- NAC/     # Input PET images
+~~~bash
+python tools/domain_metadata.py --input private_dicom_index.csv --output patients.csv
+~~~
 
-testset/
-|-- AC/
-`-- NAC/
-```
+The input index additionally contains a "dicom_path" column pointing to a NASC
+DICOM header. Unrecognized or missing metadata are rejected for explicit review.
+Do not commit clinical images, private manifests, or patient identifiers.
 
-Each `.mat` file should contain:
+## Training and validation
 
-```text
-output: H x W x S array
-```
+The retained filename "train_unipet_G1D30.json" is the ARI-PET configuration:
 
-where `S` is the number of slices. The AC and NAC files should have matched file
-names. In the current loader, the NAC path is obtained by replacing `AC` with
-`NAC` in the AC file path.
+~~~bash
+python main_train.py --opt train_unipet_G1D30.json \
+    --manifest splits/patients.csv --output runs/full --variant full
+~~~
 
-Tracer/scanner labels are parsed from the file name using the second and third
-underscore-separated fields. For example:
+Only the source-training set defines the joint scanner--radiotracer class map.
+The validation set reuses that map. The class count is determined from the
+training manifest, rather than hard-coded to a tracer count. No scanner/tracer
+label is supplied to the network at inference.
 
-```text
-case_FDG_Siemens_001.mat -> FDG_Siemens
-```
+Default settings: channel widths 48/96/192/384, blocks 4/6/6/8, heads 1/2/4/8,
+four refinement blocks, FFN expansion 2.66, bias-inclusive layer normalization,
+10 prompt components with 32 x 32 stored resolution at L4/L3/L2, Adam
+(betas 0.9/0.999, weight decay 0), learning rate 0.0002, batch size 2, 2,000,000
+iterations, MultiStepLR factor 0.5 at 500,000 and 1,000,000 updates, and EMA 0.999.
 
-## Configuration
+Training stops at the configured iteration count. Validation uses the EMA
+network, whole 3D SUV volumes and patient-averaged scores. Selection uses
+source-validation PSNR only; the formal test set is not evaluated by the
+training entry point. The configuration, domain map, manifest/code hashes,
+optimizer, scheduler, RNG state, step, and EMA state are saved with checkpoints.
+Run directories and checkpoint files are created exclusively; existing runs
+are never pruned or overwritten. Resume into a new directory:
 
-The default configuration is `train_unipet_G1D30.json`.
+~~~bash
+python main_train.py --manifest splits/patients.csv --output runs/full_resume \
+    --resume runs/full/models/50000.pth --variant full
+~~~
 
-Important fields:
+Use "--max-steps" only for shorter execution checks. The actual completed step
+is recorded in each checkpoint. "checkpoints.jsonl" records which checkpoint
+improved the source-validation score.
 
-```jsonc
-{
-  "task": "unipet_G1D30",
-  "model": "unipet",
-  "gpu_ids": [0],
-  "datasets": {
-    "train": {
-      "dataroot_H": "trainsets/AC",
-      "dataroot_L": "trainsets/NAC",
-      "H_size": 200,
-      "dataloader_batch_size": 2
-    },
-    "test": {
-      "dataroot_H": "testset/AC",
-      "dataroot_L": "testset/AC"
-    }
-  }
-}
-```
+## Objective and ablations
 
-For the default test setting, keep both `testset/AC` and `testset/NAC`
-available. The loader uses the AC path to derive the corresponding NAC path.
+The SAME objective is used by the training wrapper and standalone loss helper:
 
-## Training
+~~~text
+total = 15 * Charbonnier(pred, ASC)
+      + Charbonnier(FFT(pred), FFT(ASC))
+      + 0.1 * cross_entropy(domain_logits, source_domain_label)
+      + 0.01 * squared_normalized_inner_product(shared, specific)
+~~~
 
-Run from the project root:
+Charbonnier is mean(sqrt(error^2 + 1e-9)); the Fourier reconstruction term
+compares the real/imaginary channels. All enabled terms participate in
+backpropagation.
 
-```bash
-python main_train.py --opt train_unipet_G1D30.json
-```
+| --variant | Classification | Orthogonality | Spatial prompt | Fourier prompt |
+|---|---:|---:|---|---|
+| full | 0.1 | 0.01 | enabled | enabled |
+| noce | 0 | 0.01 | enabled | enabled |
+| no_sd | 0 | 0 | enabled | enabled |
+| no_spatial_prompt | 0.1 | 0.01 | bypassed | enabled |
+| no_fourier_prompt | 0.1 | 0.01 | enabled | no prompt gate |
 
-The script creates an experiment folder under:
+"NoCE" does not remove the orthogonality loss. Removing SD losses retains the
+two-stream architecture. Removing the Fourier prompt retains the Fourier
+feature branch without prompt-conditioned gating.
 
-```text
-unipet_promptpet_large/unipet_G1D30/
-```
+## Shared normalization and SUV restoration
 
-Checkpoints, logs, validation images, and copied option files are saved there.
-If existing checkpoints are found, training resumes automatically.
+For each resized NASC slice L, s = max(abs(L)), with s = 1 for an all-zero
+slice. The network input is L/s and the paired training target is H/s.
+ASC can exceed one after normalization. Neither ASC nor population statistics
+are used to determine s. Predictions are restored by multiplying by that same
+NASC-derived s, then resizing to the original in-plane grid. There is no
+target-based inverse scaling and no output clipping to a display window.
 
-## Validation
+## Fourier frequency coordinates
 
-Validation is controlled by `checkpoint_test` in the JSON file. The default
-value is `50000`.
+PALHBlock uses unshifted rfft2 with orthonormal normalization. Coordinates and
+masks use 2*fftfreq(H) and 2*rfftfreq(W), where W is the original spatial width.
+The radius is sqrt(fy^2 + fx^2), with low frequencies at radius <= 0.5 and the
+complement assigned to the high band. DC (0,0) is low frequency. Vertical
+positive and negative frequencies have matching masks; Nyquist is high.
+The frequency-coordinate channels use the same ordering as the masks.
+Odd spatial widths are handled explicitly, including the 25 x 25 bottleneck.
 
-During validation, the script reconstructs the test samples, reports PSNR and
-SSIM, and saves representative input/reconstruction/target images.
+Amplitude is normalized per sample/channel. Two coordinate-augmented branches
+produce band updates, modulated by sigmoid(abs(rfft2(prompt))). A separate
+learnable phase branch updates phase. L4 prompts use the specific latent
+stream, and L3/L2 prompts use the corresponding decoder features.
 
-TensorBoard can be opened with:
+## Multi-source held-out protocols
 
-```bash
-tensorboard --logdir unipet_promptpet_large/unipet_G1D30
-```
+Starting from a manifest with the formal test patients already frozen, prepare
+each source development split independently:
 
-## Model
+~~~bash
+python tools/prepare_protocol.py --manifest splits/patients.csv --setting UIH --output splits/uih.csv
+python tools/prepare_protocol.py --manifest splits/patients.csv --setting MFBG --output splits/mfbg.csv
+python tools/prepare_protocol.py --manifest splits/patients.csv --setting SinoUnion-FDG --output splits/sino_fdg.csv
+~~~
 
-The model is selected by:
+UIH excludes all UIH data; MFBG excludes all MFBG data; SinoUnion-FDG excludes
+that entire scanner--radiotracer combination from training and validation.
+Target-domain development patients are excluded, not reassigned to testing.
+The target test cohort is drawn only from the existing formal test split.
+The remaining source development patients are split at floor(7*N/8) for
+training, with the remainder used for validation. Every training domain is
+represented in source training. Use the SAME output manifest for Full, NoCE
+and comparator runs. Patient counts are calculated from the supplied manifest,
+not generated from the aggregate manuscript counts.
 
-```jsonc
-"model": "unipet",
-"netG": {
-  "net_type": "unipet"
-}
-```
+## EMA inference and evaluation
 
-The network outputs:
+~~~bash
+python main_test.py --checkpoint runs/full/models/50000.pth \
+    --manifest splits/patients.csv --output predictions/full --device cuda:0
+~~~
 
-```python
-reconstruction, tracer_logits, z_sh, z_sp = netG(input)
-```
+The default inference loader requires the explicitly saved "params_ema" state
+and matching normalization/frequency-grid metadata. It does not silently
+substitute ordinary generator weights for EMA. Each MAT output contains the
+complete native-grid SUV volume and NASC-derived scales. A reconstruction
+manifest records hashes and successful readback. Existing outputs are preserved.
 
-where `tracer_logits` is used for tracer/scanner classification, and `z_sh` and
-`z_sp` are used to regularize shared and specific feature representations.
+Add "--metrics" to evaluate saved outputs against ASC. PSNR, SSIM, nMAE (%),
+and NMSE are computed on complete 3D SUV volumes; repeated examinations are
+averaged within patients. ASC is used as a metric reference, never as a scale
+source for reconstruction. Organ/lesion masks and reader-study analyses are
+separate downstream evaluations, not part of this inference entry point.
 
-## Loss
+## Verification
 
-The training objective is implemented in `models/model_unipet.py`:
+~~~bash
+python -m unittest discover -s tests -v
+~~~
 
-```text
-loss = alpha * image reconstruction loss
-     + Fourier-domain reconstruction loss
-     + lambda_cls * tracer/scanner classification loss
-     + lambda_orth * shared-specific orthogonality loss
-```
+Tests cover objective gradients and ablations, input-only scaling and inverse
+scaling, patient/domain partition integrity, DC/Nyquist and odd-size masks,
+EMA save/load/inference, full-volume outputs, and source-only model selection.
 
-Default weights:
-
-```jsonc
-"alpha": 15,
-"lambda_cls": 0.1,
-"lambda_orth": 0.01
-```
-
-Set `lambda_cls` or `lambda_orth` to `0` if the corresponding term is not
-needed.
+This update changes the executable normalization, objective and Fourier mask
+relative to earlier repository revisions. Old weights must be paired with
+their original preprocessing and training configuration; matching tensor
+shapes alone does not establish equivalent predictions or reproduce a
+published result. The versioned checkpoint metadata identifies the behavior
+used for new runs.
 
 

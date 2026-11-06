@@ -1,0 +1,8 @@
+numpy>=1.24,<2
+scipy>=1.10
+opencv-python>=4.8,<4.12
+einops>=0.7
+scikit-image>=0.21
+pydicom>=2.4
+# Install a PyTorch build appropriate to your platform separately.
+# The active ARI-PET path is tested with PyTorch >=2.1.

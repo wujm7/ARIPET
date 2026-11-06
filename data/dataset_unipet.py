@@ -1,180 +1,120 @@
-import random
+"""Patient-partitioned, paired SUV volumes; axial network samples are 200x200."""
+import csv
+from functools import lru_cache
+from pathlib import Path
 import numpy as np
-import torch
-import torch.utils.data as data
-import utils.utils_image as util
-from utils.utils_unipet import *
-import matplotlib.pyplot as plt
-import time
 import scipy.io as sio
-import os
+import torch
+from torch.utils.data import Dataset
+from utils.pet_scaling import normalize_pair
 
 
-def generate_mask(img_height, img_width, radius, center_x, center_y):
-    y, x = np.ogrid[0:img_height, 0:img_width]
-    # circle mask
-    mask = (x - center_x) ** 2 + (y - center_y) ** 2 <= radius ** 2
-    return mask
+def canonical_domain(scanner, radiotracer):
+    scanners = {"siemens": "Siemens", "sinounion": "SinoUnion", "uih": "UIH"}
+    tracers = {"FDG", "DOTATATE", "MFBG", "FAPI", "CXCR4", "DOPA", "PSMA"}
+    scanner = scanners.get(scanner.strip().casefold())
+    tracer = radiotracer.strip().upper()
+    if scanner is None or tracer not in tracers:
+        raise ValueError("Use canonical scanner and radiotracer metadata; unknown domains are not inferred")
+    return scanner, tracer
 
 
-def imgtofrequency(img):  # input:[320,320,1]
-    zero = torch.zeros_like(img)
-    img = torch.cat((img, zero), dim=-1)
-    img = torch.view_as_complex(img)
-    ksp = torch.fft.fftshift(torch.fft.fft2(img, dim=(0, 1)), dim=(0, 1))
-    ksp = torch.view_as_real(ksp)
-    return ksp
+def read_manifest(path):
+    path = Path(path).resolve()
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    if not rows:
+        raise ValueError("Empty manifest")
+    required = {"patient_id", "study_id", "scanner", "radiotracer", "split", "nasc"}
+    if not required.issubset(rows[0]):
+        raise ValueError("Manifest requires: " + ", ".join(sorted(required)))
+    patient_splits, studies, input_paths = {}, set(), set()
+    for row in rows:
+        if any(not row[k].strip() for k in required):
+            raise ValueError("Manifest contains an empty required field")
+        for key in required:
+            row[key] = row[key].strip()
+        row["scanner"], row["radiotracer"] = canonical_domain(row["scanner"], row["radiotracer"])
+        if row["split"] not in {"train", "val", "test", "development", "excluded"}:
+            raise ValueError("Unknown split: " + row["split"])
+        pid = row["patient_id"]
+        if pid in patient_splits and patient_splits[pid] != row["split"]:
+            raise ValueError("All examinations of a patient must remain in one split")
+        patient_splits[pid] = row["split"]
+        if row["study_id"] in studies:
+            raise ValueError("study_id must be unique per volume")
+        studies.add(row["study_id"])
+        for key in ("nasc", "asc"):
+            if row.get(key):
+                file = Path(row[key]).expanduser()
+                row[key] = str((path.parent / file).resolve() if not file.is_absolute() else file.resolve())
+        if row["nasc"] in input_paths:
+            raise ValueError("A NASC volume cannot be repeated under multiple rows")
+        input_paths.add(row["nasc"])
+        if row.get("asc") == row["nasc"]:
+            raise ValueError("NASC input and ASC reference cannot be the same file")
+        row["domain"] = row["scanner"] + "__" + row["radiotracer"]
+    return rows
 
 
-def parse_tracer_from_filename(filename):
-    """
-    从文件名中解析显像剂和设备名称，作为联合分类标签。
-    文件名格式（以 _ 分割）：
-        Beijing_UIH_FDG_084444_20250818_AC.mat  -> parts[1]_parts[2] = 'UIH_FDG'
-        youyi_Siemens_DOTATATE_child_...        -> parts[1]_parts[2] = 'Siemens_DOTATATE'
-        youyi_SinoUnion_PSMA_adult_...          -> parts[1]_parts[2] = 'SinoUnion_PSMA'
-    """
-    basename = os.path.splitext(os.path.basename(filename))[0]
-    parts = basename.split('_')
-    if len(parts) >= 3:
-        return f"{parts[1]}_{parts[2]}"
-    # 如果解析失败，返回整个文件名作为兜底
-    return basename
+@lru_cache(maxsize=2)
+def load_volume(path):
+    value = sio.loadmat(path, variable_names=["output"]).get("output")
+    if value is None or value.ndim != 3 or not np.isfinite(value).all():
+        raise ValueError("MAT output must be a finite H x W x S SUV volume: " + str(path))
+    return np.asarray(value, dtype=np.float32)
 
 
-class DatasetUniPET(data.Dataset):
-
+class DatasetUniPET(Dataset):
     def __init__(self, opt):
-        super(DatasetUniPET, self).__init__()
-        print('Get L/H for image-to-image mapping. Both "paths_L" and "paths_H" are needed.')
         self.opt = opt
-        self.n_channels = self.opt['n_channels']
-        self.patch_size = self.opt['H_size']
-        self.is_noise = self.opt['is_noise']
-        self.noise_level = self.opt['noise_level']
-        self.noise_var = self.opt['noise_var']
-
-        # 强制将 ../trainsets 转换为绝对路径
-        root_H_abs = os.path.abspath(opt['dataroot_H'])
-        root_L_abs = os.path.abspath(opt['dataroot_L'])
-
-        paths_H_files = sorted(
-            [os.path.join(root_H_abs, f) for f in os.listdir(root_H_abs) if f.endswith('.mat')])
-        paths_L_files = sorted(
-            [os.path.join(root_L_abs, f) for f in os.listdir(root_L_abs) if f.endswith('.mat')])
-
-        assert paths_H_files, 'Error: High-resolution data path is empty.'
-        assert paths_L_files, 'Error: Low-resolution data path is empty.'
-        assert len(paths_H_files) == len(paths_L_files), 'Error: Mismatch in number of H and L data files.'
-
-        # -------------------------------------------------------
-        # 第一步：扫描所有文件名，收集全部显像剂名称，构建映射表
-        # -------------------------------------------------------
-        tracer_names = sorted(set(parse_tracer_from_filename(p) for p in paths_H_files))
-        self.tracer2idx = {name: idx for idx, name in enumerate(tracer_names)}
-        self.num_tracers = len(self.tracer2idx)
-        print(f"发现 {self.num_tracers} 种显像剂: {self.tracer2idx}")
-
-        self.mask = generate_mask(128, 128, 64, 64, 64)
-        self.mask = np.expand_dims(self.mask, axis=-1)
-        self.target_size = (200, 200)  # <--- 定义目标尺寸
-
-        # -------------------------------------------------------
-        # 第二步：扫描各文件，构建 slice 索引列表（同时记录 tracer_label）
-        # -------------------------------------------------------
+        self.phase = opt.get("phase", "train")
+        all_rows = read_manifest(opt["manifest"])
+        training_domains = sorted({r["domain"] for r in all_rows if r["split"] == "train"})
+        supplied = opt.get("domain_map")
+        self.domain_map = dict(supplied) if supplied is not None else {
+            name: i for i, name in enumerate(training_domains)}
+        if sorted(self.domain_map.values()) != list(range(len(self.domain_map))):
+            raise ValueError("Training domain indices must be contiguous from zero")
+        if self.phase in {"train", "val"} and not self.domain_map:
+            raise ValueError("A source-training domain map is required")
+        self.rows = [r for r in all_rows if r["split"] == self.phase]
+        if not self.rows:
+            raise ValueError("No rows for split " + self.phase)
+        self.need_H = opt.get("need_H", True)
+        self.target_size = (200, 200)
+        self.num_domains = len(self.domain_map)
+        # Compatibility names denote joint scanner--radiotracer classes.
+        self.tracer2idx, self.num_tracers = self.domain_map, self.num_domains
         self.slice_info = []
-        print("Scanning dataset to build slice manifest...")
-        for h_path in paths_H_files:
-            l_path = h_path.replace('AC', 'NAC')
-            # 检查对应的 NAC 文件是否存在
-            if not os.path.exists(l_path):
-                print(f"Warning: Missing pair! Found {h_path} but not {l_path}. Skipping.")
-                continue
-
-            # 解析显像剂标签
-            tracer_name = parse_tracer_from_filename(h_path)
-            tracer_label = self.tracer2idx[tracer_name]
-
-            try:
-                # Load headers to get dimensions without loading all data
-                h_mat = sio.loadmat(h_path, variable_names=['output'])['output']
-                l_mat = sio.loadmat(l_path, variable_names=['output'])['output']
-                if abs(h_mat.shape[2] - l_mat.shape[2]) < 10 and (h_mat.shape[2] != l_mat.shape[2]):
-                    sub_slice = abs(h_mat.shape[2] - l_mat.shape[2])
-                    if h_mat.shape[2] > l_mat.shape[2]:
-                        h_mat = h_mat[:, :, sub_slice:]
-                    else:
-                        l_mat = l_mat[:, :, sub_slice:]
-
-                assert h_mat.shape[2] == l_mat.shape[2], f"Slice count mismatch in {h_path} and {l_path}"
-
-                for i in range(h_mat.shape[2]):
-                    h_slice = h_mat[:, :, i]
-                    l_slice = l_mat[:, :, i]
-                    if h_slice.max() == h_slice.min() or l_slice.max() == l_slice.min():
-                        continue  # Skip blank slices
-
-                    self.slice_info.append({
-                        'H_path': h_path,
-                        'L_path': l_path,
-                        'slice_index': i,
-                        'tracer_label': tracer_label   # 新增：显像剂整数标签
-                    })
-            except Exception as e:
-                print(f"Could not process file pair: {h_path}, {l_path}. Error: {e}")
-
-        print(f"Found {len(self.slice_info)} valid slices.")
-        assert len(self.slice_info) > 0, "Error: No valid slices found in the dataset."
-
-    def __getitem__(self, index):
-        time0 = time.time()
-
-        # Get the information for the requested slice from the manifest
-        slice_meta = self.slice_info[index]
-        h_path = slice_meta['H_path']
-        l_path = slice_meta['L_path']
-        slice_idx = slice_meta['slice_index']
-        tracer_label = slice_meta['tracer_label']
-
-        # --- On-demand loading and processing ---
-        gt_slice = sio.loadmat(h_path)['output'][:, :, slice_idx].astype(np.float32)
-        gt_slice_resized = cv2.resize(gt_slice, self.target_size, interpolation=cv2.INTER_CUBIC)
-        gt = np.reshape(gt_slice_resized, (self.target_size[0], self.target_size[1], 1))
-        gt = (gt - gt.min()) / (gt.max() - gt.min() + 1e-15)
-        patch_H = torch.from_numpy(gt)
-
-        l_slice = sio.loadmat(l_path)['output'][:, :, slice_idx].astype(np.float32)
-        l_slice_resized = cv2.resize(l_slice, self.target_size, interpolation=cv2.INTER_CUBIC)
-        l = np.reshape(l_slice_resized, (self.target_size[0], self.target_size[1], 1))
-        l = (l - l.min()) / (l.max() - l.min() + 1e-15)
-        patch_L = torch.from_numpy(l)
-        # --- End of on-demand loading ---
-
-        b = imgtofrequency(patch_L)
-        img_L, img_H, b = util.float2tensor3(patch_L), util.float2tensor3(patch_H), util.float2tensor3(b)
-
-        descriptive_path = f"{h_path}_slice_{slice_idx}"
-        time1 = time.time()
-        return {
-            'L': img_L,
-            'H': img_H,
-            'H_path': descriptive_path,
-            'img_info': str(index),
-            'tracer_label': torch.tensor(tracer_label, dtype=torch.long)  # 新增
-        }
+        for index, row in enumerate(self.rows):
+            if self.phase in {"train", "val"} and row["domain"] not in self.domain_map:
+                raise ValueError("Development contains a domain absent from source training")
+            low = load_volume(row["nasc"])
+            if self.need_H:
+                if not row.get("asc"):
+                    raise ValueError("Paired training/validation requires an ASC path")
+                high = load_volume(row["asc"])
+                if low.shape != high.shape:
+                    raise ValueError("NASC and ASC must be aligned before loading; shapes differ")
+            for z in range(low.shape[2]):
+                self.slice_info.append((index, z))
 
     def __len__(self):
         return len(self.slice_info)
 
-    def undersample_kspace(self, x, mask, is_noise, noise_level, noise_var):
-        fft = fft2(x)
-        mask = mask.unsqueeze(-1)
-        fft = fft * mask
-        x = ifft2(fft)
-        return x, fft
-
-    def generate_gaussian_noise(self, x, noise_level, noise_var):
-        spower = np.sum(x ** 2) / x.size
-        npower = noise_level / (1 - noise_level) * spower
-        noise = np.random.normal(0, noise_var ** 0.5, x.shape) * np.sqrt(npower)
-        return noise
+    def __getitem__(self, index):
+        row_index, z = self.slice_info[index]
+        row = self.rows[row_index]
+        low = load_volume(row["nasc"])[:, :, z]
+        high = load_volume(row["asc"])[:, :, z] if self.need_H else None
+        low, high, scale = normalize_pair(low, high, self.target_size)
+        label = self.domain_map.get(row["domain"], -1)
+        result = {"L": torch.from_numpy(low[None].copy()), "scale": scale,
+                  "domain_label": torch.tensor(label), "tracer_label": torch.tensor(label),
+                  "patient_id": row["patient_id"], "study_id": row["study_id"],
+                  "slice_index": z, "L_path": row["nasc"]}
+        if high is not None:
+            result["H"] = torch.from_numpy(high[None].copy())
+            result["H_path"] = row["asc"]
+        return result

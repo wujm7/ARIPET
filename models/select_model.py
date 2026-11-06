@@ -4,7 +4,7 @@ def define_Model(opt):
 
 
 
-    if model == 'unipet':
+    if model in ('unipet', 'aripet'):
         from models.model_unipet import UniPETModel as M
 
     else:

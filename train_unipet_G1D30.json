@@ -1,134 +1,56 @@
 {
-  "task": "unipet_G1D30" // task name
-  ,
-  "model": "unipet" // find keywords in ./models/select_model.py
-  ,
-  "mask": "G1D30" // find keywords in ./models/select_mask.py
-  ,
+  "task": "aripet_full",
+  "model": "unipet",
   "gpu_ids": [
     0
   ],
-  "dist": false // distributed computing
-  ,
-  "n_channels": 1 // 1 for grayscale, 3 for color
-  ,
+  "dist": false,
+  "n_channels": 1,
   "manual_seed": 42,
   "path": {
-    "root": "unipet_promptpet_large",
-    "pretrained_netG": null // path of pretrained model
-    ,
-    "pretrained_netE": null // path of pretrained model
+    "root": "runs",
+    "pretrained_netG": null,
+    "pretrained_netE": null
   },
   "datasets": {
     "train": {
-      "name": "train_dataset",
-      "dataset_type": "unipet",
-      "dataroot_H": "trainsets/AC" // path of H training dataset
-      ,
-      "dataroot_L": "trainsets/NAC" // path of H training dataset
-      ,
-      "mask": "G1D30" // find keywords in ./models/select_mask.py
-      ,
-      "H_size": 200 // patch number
-      ,
-      "sigma": 15,
-      "sigma_test": 15,
-      "is_noise": false // add noise in k-space
-      ,
-      "noise_level": 0.0 // NL = S/(S+N)
-      ,
-      "noise_var": 0.1,
-      "is_mini_dataset": false // for debug
-      ,
-      "mini_dataset_prec": 1,
-      "dataloader_shuffle": true,
-      "dataloader_num_workers": 8,
-      "dataloader_batch_size": 1
+      "manifest": "splits/patients.csv",
+      "dataloader_batch_size": 2,
+      "dataloader_num_workers": 0
     },
-    "test": {
-      "name": "test_dataset",
-      "dataset_type": "unipet",
-      "dataroot_H": "testset/AC" // path of H training dataset
-      ,
-      "dataroot_L": "testset/AC" // path of H training dataset
-      ,
-      "mask": "G1D30" // find keywords in ./models/select_mask.py
-      ,
-      "sigma": 15,
-      "sigma_test": 15,
-      "is_noise": false // add noise in k-space
-      ,
-      "noise_level": 0.0 // NL = S/(S+N)
-      ,
-      "noise_var": 0.1,
-      "resize_for_fid": false
+    "val": {
+      "manifest": "splits/patients.csv"
     }
   },
   "netG": {
-    "net_type": "unipet",
-    "upscale": 1,
-    "in_chans": 1,
-    "img_size": 200,
-    "window_size": 8,
-    "img_range": 1.0,
-    "depths": [
-      6,
-      6,
-      6
-    ],
-    "embed_dim": 36,
-    "num_heads": [
-      6,
-      6,
-      6
-    ],
-    "mlp_ratio": 2,
-    "upsampler": null,
-    "resi_connection": "1conv",
+    "net_type": "aripet",
     "init_type": "default",
     "init_bn_type": "uniform",
-    "init_gain": 0.2
+    "init_gain": 0.2,
+    "spatial_prompt": true,
+    "fourier_prompt": true
   },
   "train": {
-    "G_lossfn_type": "charbonnier" // "l1" | "l2sum" | "l2" | "ssim" | "charbonnier" preferred
-    ,
-    "G_lossfn_weight": 1.0 // default 1.0
-    ,
-    "G_charbonnier_eps": 1e-9 // default 1e-9
-    ,
-    "alpha": 15 // default 15
-    ,
-    "beta": 0.0010 // default 0.1
-    ,
-    "gamma": 0.0025 // default 0.0025
-    ,
-    "E_decay": 0.999 // Exponential Moving Average for netG: set 0 to disable; default setting 0.999
-    ,
-    "G_optimizer_type": "adam" // fixed, adam is enough
-    ,
-    "G_optimizer_lr": 2e-4 // learning rate default 2e-4
-    ,
-    "G_optimizer_wd": 0 // weight decay, default 0
-    ,
+    "G_lossfn_type": "charbonnier",
+    "G_lossfn_weight": 1,
+    "G_charbonnier_eps": 1e-9,
+    "alpha": 15,
+    "lambda_cls": 0.1,
+    "lambda_orth": 0.01,
+    "E_decay": 0.999,
+    "G_optimizer_type": "adam",
+    "G_optimizer_lr": 0.0002,
+    "G_optimizer_wd": 0,
     "G_optimizer_clipgrad": null,
-    "G_optimizer_reuse": true,
-    "G_scheduler_type": "MultiStepLR",
     "G_scheduler_milestones": [
       500000,
       1000000
     ],
     "G_scheduler_gamma": 0.5,
-    "G_regularizer_orthstep": null,
-    "G_regularizer_clipstep": null,
-    "G_param_strict": true,
-    "E_param_strict": true,
-    "lambda_cls": 0.1,
-    "lambda_orth": 0.01,
-    "checkpoint_test": 50000,
+    "total_iterations": 2000000,
+    "checkpoint_val": 50000,
     "checkpoint_save": 50000,
     "checkpoint_print": 200,
-    "is_early_stopping": false,
-    "early_stopping_num": 8,
     "freeze_patch_embedding": false
   }
 }

@@ -21,11 +21,15 @@ class CoordConcat(nn.Module):
         super(CoordConcat, self).__init__()
         self.with_r = with_r
 
-    def forward(self, x):
+    def forward(self, x, spatial_width):
         B, C, H, W = x.shape
-        # 生成坐标网格 (-1 到 1)
-        y_coords = torch.linspace(-1.0, 1.0, steps=H, device=x.device).view(1, 1, H, 1).expand(B, 1, H, W)
-        x_coords = torch.linspace(-1.0, 1.0, steps=W, device=x.device).view(1, 1, 1, W).expand(B, 1, H, W)
+        # Nyquist-normalized coordinates in the SAME unshifted rfft2 order.
+        y = 2 * torch.fft.fftfreq(H, device=x.device, dtype=x.dtype)
+        fx = 2 * torch.fft.rfftfreq(spatial_width, device=x.device, dtype=x.dtype)
+        if len(fx) != W:
+            raise ValueError("Half-spectrum shape does not match spatial width")
+        y_coords = y.view(1, 1, H, 1).expand(B, 1, H, W)
+        x_coords = fx.view(1, 1, 1, W).expand(B, 1, H, W)
 
         coords = [x, y_coords, x_coords]
 
@@ -75,10 +79,11 @@ class PALHBlock(nn.Module):
         )
 
     def _build_band_masks(self, h, w, device, dtype):
-        yy = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype).view(h, 1)
-        xx = torch.linspace(0.0, 1.0, steps=w, device=device, dtype=dtype).view(1, w)
+        # h,w are spatial dimensions: retain w to handle odd widths correctly.
+        yy = (2 * torch.fft.fftfreq(h, device=device, dtype=dtype)).view(h, 1)
+        xx = (2 * torch.fft.rfftfreq(w, device=device, dtype=dtype)).view(1, -1)
         rr = torch.sqrt(yy ** 2 + xx ** 2)
-        low_mask = (rr <= 0.5).float().view(1, 1, h, w)
+        low_mask = (rr <= 0.5).to(dtype).view(1, 1, h, w // 2 + 1)
         high_mask = 1.0 - low_mask
         return low_mask, high_mask
 
@@ -88,14 +93,14 @@ class PALHBlock(nn.Module):
         phase = torch.angle(fft_x)
 
         amp_mean = amp.mean(dim=(2, 3), keepdim=True)
-        amp_std = amp.std(dim=(2, 3), keepdim=True) + 1e-9
-        amp_norm = (amp - amp_mean) / amp_std
+        amp_std = amp.std(dim=(2, 3), keepdim=True, unbiased=False)
+        amp_norm = (amp - amp_mean) / (amp_std + 1e-9)
 
-        amp_with_coord = self.coord(amp_norm)
+        amp_with_coord = self.coord(amp_norm, spatial_width=x.shape[-1])
         amp_low = self.amp_low_conv(amp_with_coord)
         amp_high = self.amp_high_conv(amp_with_coord)
 
-        low_mask, high_mask = self._build_band_masks(amp.shape[2], amp.shape[3], amp.device, amp.dtype)
+        low_mask, high_mask = self._build_band_masks(x.shape[-2], x.shape[-1], amp.device, amp.dtype)
 
         if prompt is not None:
             prompt_freq = torch.fft.rfft2(prompt, s=x.shape[-2:], norm='ortho')
@@ -113,7 +118,7 @@ class PALHBlock(nn.Module):
         phase_processed = self.phase_conv(phase)
         phase_out = phase + phase_processed
 
-        complex_out = torch.polar(torch.clamp(amp_out, min=1e-8), phase_out)
+        complex_out = torch.complex(amp_out * torch.cos(phase_out), amp_out * torch.sin(phase_out))
         out = torch.fft.irfft2(complex_out, s=x.shape[-2:], norm='ortho')
         return out
 
@@ -312,8 +317,8 @@ class PromptGenBlock(nn.Module):
 
 class Restormer(nn.Module):
     def __init__(self,
-                 inp_channels=3,
-                 out_channels=3,
+                 inp_channels=1,
+                 out_channels=1,
                  dim=48,
                  num_blocks=[4, 6, 6, 8],
                  num_refinement_blocks=4,
@@ -323,11 +328,15 @@ class Restormer(nn.Module):
                  LayerNorm_type='WithBias',
                  dual_pixel_task=False,
                  use_prompt=True,
-                 prompt_len=5,
-                 num_tracers=4
+                 prompt_len=10,
+                 num_tracers=13,
+                 spatial_prompt=True,
+                 fourier_prompt=True
                  ):
         super(Restormer, self).__init__()
         self.use_prompt = use_prompt
+        self.spatial_prompt = spatial_prompt
+        self.fourier_prompt = fourier_prompt
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
 
@@ -462,9 +471,9 @@ class Restormer(nn.Module):
         if self.use_prompt:
             prompt = self.prompt_l4(z_sp)
             # 1) 空间域 prompt 注入
-            spatial_feat = self.spatial_fusion_l4(torch.cat([latent_core, prompt], dim=1))
+            spatial_feat = self.spatial_fusion_l4(torch.cat([latent_core, prompt], dim=1)) if self.spatial_prompt else latent_core
             # 2) 频域 prompt 调制
-            freq_feat = self.palh_l4(latent_core, prompt=prompt)
+            freq_feat = self.palh_l4(latent_core, prompt=prompt if self.fourier_prompt else None)
             latent = torch.cat([spatial_feat, freq_feat], dim=1)
             latent = self.fusion_l4(latent)
         else:
@@ -482,9 +491,9 @@ class Restormer(nn.Module):
         if self.use_prompt:
             prompt_3 = self.prompt_l3(out_dec_level3)
             # 1) 空间域 prompt 注入
-            spatial_feat_3 = self.spatial_fusion_l3(torch.cat([out_dec_level3, prompt_3], dim=1))
+            spatial_feat_3 = self.spatial_fusion_l3(torch.cat([out_dec_level3, prompt_3], dim=1)) if self.spatial_prompt else out_dec_level3
             # 2) 频域 prompt 调制
-            freq_feat_3 = self.palh_l3(out_dec_level3, prompt=prompt_3)
+            freq_feat_3 = self.palh_l3(out_dec_level3, prompt=prompt_3 if self.fourier_prompt else None)
             # 3) 空间域和频域融合
             out_dec_level3 = torch.cat([spatial_feat_3, freq_feat_3], dim=1)
             out_dec_level3 = self.fusion_l3(out_dec_level3)
@@ -502,9 +511,9 @@ class Restormer(nn.Module):
         if self.use_prompt:
             prompt_2 = self.prompt_l2(out_dec_level2)
             # 1) 空间域 prompt 注入
-            spatial_feat_2 = self.spatial_fusion_l2(torch.cat([out_dec_level2, prompt_2], dim=1))
+            spatial_feat_2 = self.spatial_fusion_l2(torch.cat([out_dec_level2, prompt_2], dim=1)) if self.spatial_prompt else out_dec_level2
             # 2) 频域 prompt 调制
-            freq_feat_2 = self.palh_l2(out_dec_level2, prompt=prompt_2)
+            freq_feat_2 = self.palh_l2(out_dec_level2, prompt=prompt_2 if self.fourier_prompt else None)
             # 3) 空间域和频域融合
             out_dec_level2 = torch.cat([spatial_feat_2, freq_feat_2], dim=1)
             out_dec_level2 = self.fusion_l2(out_dec_level2)
@@ -529,22 +538,7 @@ class Restormer(nn.Module):
 
 
 
-def compute_orth_loss(z_sh, z_sp):
-    zsh_vec = F.normalize(z_sh.flatten(1), dim=1)
-    zsp_vec = F.normalize(z_sp.flatten(1), dim=1)
-    return ((zsh_vec * zsp_vec).sum(dim=1) ** 2).mean()
-
-
-def compute_total_loss(pred, target, tracer_logits, tracer_label, z_sh, z_sp, lambda_cls=0.1, lambda_orth=0.01):
-    loss_rec = F.l1_loss(pred, target)
-    loss_cls = F.cross_entropy(tracer_logits, tracer_label)
-    loss_orth = compute_orth_loss(z_sh, z_sp)
-    total_loss = loss_rec + lambda_cls * loss_cls + lambda_orth * loss_orth
-    return total_loss, {
-        'loss_rec': loss_rec.detach(),
-        'loss_cls': loss_cls.detach(),
-        'loss_orth': loss_orth.detach()
-    }
+from models.pet_objective import compute_orth_loss, compute_total_loss
 
 if __name__ == '__main__':
     # ---------------------------------------------------------------
@@ -561,7 +555,7 @@ if __name__ == '__main__':
         out_channels=channels,
         dim=48,
         use_prompt=True,  # 开启 Prompt
-        prompt_len=5
+        prompt_len=10
     )
 
     # 计算参数量

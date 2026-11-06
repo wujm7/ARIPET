@@ -2,17 +2,19 @@
 
 import functools
 import torch
-import torchvision.models
 from torch.nn import init
 
 
-def define_G(opt, num_tracers=4):
+def define_G(opt, num_tracers=None):
     opt_net = opt['netG']
     net_type = opt_net['net_type']
 
-    if net_type == 'unipet':
+    if net_type in ('unipet', 'aripet'):
         from models.restormer_tracer_split_bandprompt import Restormer as net
 
+        num_tracers = num_tracers if num_tracers is not None else opt_net.get('num_domains', opt_net.get('num_tracers'))
+        if not num_tracers or num_tracers < 1:
+            raise ValueError("Set num_domains from the source-training domain map")
         netG = net(
             inp_channels=1,
             out_channels=1,
@@ -26,7 +28,9 @@ def define_G(opt, num_tracers=4):
             dual_pixel_task=False,
             use_prompt=True,
             prompt_len=10,
-            num_tracers=num_tracers
+            num_tracers=num_tracers,
+            spatial_prompt=opt_net.get('spatial_prompt', True),
+            fourier_prompt=opt_net.get('fourier_prompt', True)
         )
 
     else:
