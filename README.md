@@ -52,10 +52,10 @@ Do not commit clinical images, private manifests, or patient identifiers.
 
 ## Training and validation
 
-The retained filename "train_unipet_G1D30.json" is the ARI-PET configuration:
+The ARI-PET training configuration is "train_aripet_G1D30.json":
 
 ~~~bash
-python main_train.py --opt train_unipet_G1D30.json \
+python main_train.py --opt train_aripet_G1D30.json \
     --manifest splits/patients.csv --output runs/full --variant full
 ~~~
 

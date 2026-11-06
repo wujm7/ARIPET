@@ -4,8 +4,8 @@
 def define_Dataset(dataset_opt):
     dataset_type = dataset_opt.get('dataset_type', 'aripet').lower()
 
-    if dataset_type in ['unipet', 'aripet']:
-        from data.dataset_unipet import DatasetUniPET as D
+    if dataset_type == 'aripet':
+        from data.dataset_aripet import DatasetARIPET as D
     else:
         raise NotImplementedError('Dataset [{:s}] is not found.'.format(dataset_type))
 

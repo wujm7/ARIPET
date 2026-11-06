@@ -65,7 +65,7 @@ def load_volume(path):
     return np.asarray(value, dtype=np.float32)
 
 
-class DatasetUniPET(Dataset):
+class DatasetARIPET(Dataset):
     def __init__(self, opt):
         self.opt = opt
         self.phase = opt.get("phase", "train")

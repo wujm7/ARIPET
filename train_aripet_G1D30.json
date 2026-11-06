@@ -1,6 +1,6 @@
 {
   "task": "aripet_full",
-  "model": "unipet",
+  "model": "aripet",
   "gpu_ids": [
     0
   ],

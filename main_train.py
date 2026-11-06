@@ -8,8 +8,8 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from data.dataset_unipet import DatasetUniPET, load_volume
-from models.model_unipet import UniPETModel
+from data.dataset_aripet import DatasetARIPET, load_volume
+from models.model_aripet import ARIPETModel
 from utils.pet_inference import reconstruct_volume
 from utils.pet_metrics import volume_metrics, patient_means
 from utils.pet_scaling import NORMALIZATION
@@ -43,7 +43,7 @@ def validate(model, rows):
 
 def _main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--opt", default="train_unipet_G1D30.json")
+    parser.add_argument("--opt", default="train_aripet_G1D30.json")
     parser.add_argument("--manifest", help="Patient-level CSV (overrides both train/val paths)")
     parser.add_argument("--output", help="New run directory; existing directories are never overwritten")
     parser.add_argument("--variant", choices=VARIANTS, default="full")
@@ -82,9 +82,9 @@ def _main():
     if use_cuda:
         torch.cuda.manual_seed_all(seed)
     train_settings = dict(opt["datasets"]["train"], phase="train")
-    train_set = DatasetUniPET(train_settings)
+    train_set = DatasetARIPET(train_settings)
     val_settings = dict(opt["datasets"]["val"], phase="val", domain_map=train_set.domain_map)
-    val_set = DatasetUniPET(val_settings)
+    val_set = DatasetARIPET(val_settings)
     opt["netG"]["num_domains"] = train_set.num_domains
     opt["domain_map"] = train_set.domain_map
     opt["manifest_sha256"] = hashlib.sha256(Path(manifest).read_bytes()).hexdigest()
@@ -106,7 +106,7 @@ def _main():
     logger.setLevel(logging.INFO)
     logger.addHandler(logging.StreamHandler())
     logger.addHandler(logging.FileHandler(output / "train.log", encoding="utf-8", mode="x"))
-    model = UniPETModel(opt)
+    model = ARIPETModel(opt)
     model.init_train()
     logger.info(model.info_params())
     step, epoch, batch_cursor, best = 0, 0, 0, -float("inf")

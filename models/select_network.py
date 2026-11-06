@@ -9,7 +9,7 @@ def define_G(opt, num_tracers=None):
     opt_net = opt['netG']
     net_type = opt_net['net_type']
 
-    if net_type in ('unipet', 'aripet'):
+    if net_type == 'aripet':
         from models.restormer_tracer_split_bandprompt import Restormer as net
 
         num_tracers = num_tracers if num_tracers is not None else opt_net.get('num_domains', opt_net.get('num_tracers'))

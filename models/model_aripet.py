@@ -1,4 +1,4 @@
-"""ARI-PET training wrapper. Compatibility class name: UniPETModel."""
+"""ARI-PET training wrapper."""
 from collections import OrderedDict
 from copy import deepcopy
 from pathlib import Path
@@ -8,7 +8,7 @@ from models.pet_objective import compute_total_loss, compute_orth_loss
 from utils.pet_scaling import NORMALIZATION
 
 
-class UniPETModel:
+class ARIPETModel:
     def __init__(self, opt):
         self.opt = opt
         self.opt_train = opt["train"]

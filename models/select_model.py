@@ -4,8 +4,8 @@ def define_Model(opt):
 
 
 
-    if model in ('unipet', 'aripet'):
-        from models.model_unipet import UniPETModel as M
+    if model == 'aripet':
+        from models.model_aripet import ARIPETModel as M
 
     else:
         raise NotImplementedError('Model [{:s}] is not defined.'.format(model))

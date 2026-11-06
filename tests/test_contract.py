@@ -9,10 +9,10 @@ from unittest.mock import patch
 import numpy as np
 import scipy.io as sio
 import torch
-from data.dataset_unipet import DatasetUniPET, read_manifest, load_volume
+from data.dataset_aripet import DatasetARIPET, read_manifest, load_volume
 from models.pet_objective import compute_total_loss, fourier_channels, charbonnier
 from models.restormer_tracer_split_bandprompt import PALHBlock, CoordConcat, Restormer
-from models.model_unipet import UniPETModel
+from models.model_aripet import ARIPETModel
 from utils.pet_scaling import normalize_pair, restore_suv
 from utils.pet_inference import reconstruct_volume, load_ema_checkpoint
 from utils.pet_metrics import volume_metrics, patient_means
@@ -32,7 +32,7 @@ def small_network(opt, num_tracers=None):
 
 
 def options(directory):
-    opt = json.loads((ROOT / "train_unipet_G1D30.json").read_text())
+    opt = json.loads((ROOT / "train_aripet_G1D30.json").read_text())
     opt.update(is_train=True, device="cpu")
     opt["netG"]["num_domains"] = 2
     opt["path"]["models"] = str(Path(directory) / "models")
@@ -170,9 +170,9 @@ class DatasetTests(unittest.TestCase):
     def test_source_label_map_pairing_and_all_slices(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_manifest(tmp)
-            train = DatasetUniPET(dict(manifest=path, phase="train"))
-            val = DatasetUniPET(dict(manifest=path, phase="val", domain_map=train.domain_map))
-            test = DatasetUniPET(dict(manifest=path, phase="test", need_H=False, domain_map=train.domain_map))
+            train = DatasetARIPET(dict(manifest=path, phase="train"))
+            val = DatasetARIPET(dict(manifest=path, phase="val", domain_map=train.domain_map))
+            test = DatasetARIPET(dict(manifest=path, phase="test", need_H=False, domain_map=train.domain_map))
             self.assertEqual(len(train), 6)
             self.assertEqual(val[0]["domain_label"].item(), train.domain_map["UIH__PSMA"])
             self.assertEqual(test[0]["domain_label"].item(), -1)
@@ -194,7 +194,7 @@ class DatasetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_manifest(tmp)
             path.write_text(path.read_text().replace("3_asc.mat", "unavailable_reference.mat"))
-            test = DatasetUniPET(dict(manifest=path, phase="test", need_H=False))
+            test = DatasetARIPET(dict(manifest=path, phase="test", need_H=False))
             self.assertEqual(len(test), 3)
 
     def test_target_domain_excluded_from_all_development(self):
@@ -214,8 +214,8 @@ class DatasetTests(unittest.TestCase):
 
 class ModelTests(unittest.TestCase):
     def test_ema_default_inference_and_no_reference(self):
-        with tempfile.TemporaryDirectory() as tmp, patch("models.model_unipet.define_G", side_effect=small_network):
-            model = UniPETModel(options(tmp))
+        with tempfile.TemporaryDirectory() as tmp, patch("models.model_aripet.define_G", side_effect=small_network):
+            model = ARIPETModel(options(tmp))
             model.netG.output.weight.data.zero_()
             model.netE.output.weight.data.fill_(0.01)
             model.feed_data({"L": torch.rand(1, 1, 32, 32)}, need_H=False)
@@ -226,8 +226,8 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(model.netG.training, generator_before)
 
     def test_training_checkpoint_roundtrip_and_exclusive_save(self):
-        with tempfile.TemporaryDirectory() as tmp, patch("models.model_unipet.define_G", side_effect=small_network), patch("models.select_network.define_G", side_effect=small_network):
-            model = UniPETModel(options(tmp))
+        with tempfile.TemporaryDirectory() as tmp, patch("models.model_aripet.define_G", side_effect=small_network), patch("models.select_network.define_G", side_effect=small_network):
+            model = ARIPETModel(options(tmp))
             model.init_train()
             old_ema = deepcopy(model.netE.state_dict())
             model.feed_data({"L": torch.rand(2, 1, 32, 32), "H": torch.rand(2, 1, 32, 32),
@@ -252,7 +252,7 @@ class ModelTests(unittest.TestCase):
 class EntrypointTests(unittest.TestCase):
     def test_zero_steps_never_falls_back_to_full_training(self):
         import main_train
-        with patch.object(sys, "argv", ["main_train.py", "--opt", str(ROOT / "train_unipet_G1D30.json"),
+        with patch.object(sys, "argv", ["main_train.py", "--opt", str(ROOT / "train_aripet_G1D30.json"),
                                         "--max-steps", "0"]):
             with self.assertRaisesRegex(ValueError, "positive"):
                 main_train.main()
@@ -260,11 +260,11 @@ class EntrypointTests(unittest.TestCase):
     def test_train_resume_ema_native_suv_inference(self):
         import main_train
         import main_test
-        with tempfile.TemporaryDirectory() as tmp, patch("models.model_unipet.define_G", side_effect=small_network), patch("models.select_network.define_G", side_effect=small_network):
+        with tempfile.TemporaryDirectory() as tmp, patch("models.model_aripet.define_G", side_effect=small_network), patch("models.select_network.define_G", side_effect=small_network):
             root = Path(tmp)
             manifest = make_manifest(root)
             def train(folder, steps, resume=None):
-                argv = ["main_train.py", "--opt", str(ROOT / "train_unipet_G1D30.json"),
+                argv = ["main_train.py", "--opt", str(ROOT / "train_aripet_G1D30.json"),
                         "--manifest", str(manifest), "--output", str(root / folder),
                         "--device", "cpu", "--max-steps", str(steps)]
                 if resume:
