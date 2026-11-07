@@ -130,8 +130,11 @@ masks use 2*fftfreq(H) and 2*rfftfreq(W), where W is the original spatial width.
 The radius is sqrt(fy^2 + fx^2), with low frequencies at radius <= 0.5 and the
 complement assigned to the high band. DC (0,0) is low frequency. Vertical
 positive and negative frequencies have matching masks; Nyquist is high.
-The frequency-coordinate channels use the same ordering as the masks.
-Odd spatial widths are handled explicitly, including the 25 x 25 bottleneck.
+The coordinate channels use the same unshifted frequency ordering as the masks.
+The vertical coordinates lie in [-1, 1), while the horizontal half-spectrum
+coordinates lie in [0, 1] and contain no negative frequencies. The horizontal
+Nyquist endpoint is present only for even spatial widths. Odd spatial widths
+are handled explicitly, including the 25 x 25 bottleneck.
 
 Amplitude is normalized per sample/channel. Two coordinate-augmented branches
 produce band updates, modulated by sigmoid(abs(rfft2(prompt))). A separate
@@ -187,12 +190,3 @@ python -m unittest discover -s tests -v
 Tests cover objective gradients and ablations, input-only scaling and inverse
 scaling, patient/domain partition integrity, DC/Nyquist and odd-size masks,
 EMA save/load/inference, full-volume outputs, and source-only model selection.
-
-This update changes the executable normalization, objective and Fourier mask
-relative to earlier repository revisions. Old weights must be paired with
-their original preprocessing and training configuration; matching tensor
-shapes alone does not establish equivalent predictions or reproduce a
-published result. The versioned checkpoint metadata identifies the behavior
-used for new runs.
-
-
